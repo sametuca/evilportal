@@ -36,3 +36,7 @@ SHARE_INTERNET=1
 PORTAL_TEMPLATE="instagram"
 BRAND="Hesap Güvenliği Merkezi"
 SUCCESS_URL="https://www.google.com"
+
+# ---------- Handshake kırma -----------------------------------
+WORDLIST="/usr/share/wordlists/rockyou.txt"
+CAPTURE_TIMEOUT="60"

