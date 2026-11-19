@@ -20,7 +20,6 @@ from flask import Flask, Response, jsonify, request
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(BASE, "config.sh")
 CREDS = os.path.join(BASE, "capture", "creds.log")
-PSK_FILE = os.path.join(BASE, "capture", "psk.txt")
 SETUP = os.path.join(BASE, "setup.sh")
 AUTOPWN = os.path.join(BASE, "autopwn.sh")
 PORT = 8099
@@ -34,6 +33,7 @@ CLOG = []
 CLOG_LOCK = threading.Lock()
 CPROC = None
 CPROC_LOCK = threading.Lock()
+CAPTURE_BSSID = ""
 
 SCAN_LOCK = threading.Lock()
 
@@ -42,12 +42,25 @@ app = Flask(__name__)
 
 # ---------------------------------------------------------------- config
 def parse_value(raw: str) -> str:
-    """config.sh satır değerini yorumlardan arındırarak oku."""
+    """config.sh satır değerini yorumlardan/kaçışlardan arındırarak oku."""
     raw = raw.strip()
-    if raw[:1] in ("'", '"'):
-        q = raw[0]
-        end = raw.find(q, 1)
-        return raw[1:end] if end != -1 else raw[1:]
+    if not raw:
+        return ""
+    q = raw[0]
+    if q in ("'", '"'):
+        out = []
+        i = 1
+        while i < len(raw):
+            ch = raw[i]
+            if q == '"' and ch == "\\" and i + 1 < len(raw):
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if ch == q:
+                break
+            out.append(ch)
+            i += 1
+        return "".join(out)
     return raw.split("#", 1)[0].strip()
 
 
@@ -66,22 +79,30 @@ def read_config() -> dict:
     return cfg
 
 
-def _clean(v) -> str:
-    return str(v).replace('"', "").replace("\n", " ").replace("\r", " ")
+def _quote(v) -> str:
+    """Değeri bash uyumlu çift tırnakla yaz ($ \" ` \\ kaçışlarıyla)."""
+    s = str(v).replace("\r", " ").replace("\n", " ")
+    s = (s.replace("\\", "\\\\").replace('"', '\\"')
+          .replace("$", "\\$").replace("`", "\\`"))
+    return f'"{s}"'
 
 
 def _trailing_comment(rest: str) -> str:
-    in_q = False
-    q = ""
-    for i, ch in enumerate(rest):
+    in_q = ""
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
         if in_q:
-            if ch == q:
-                in_q = False
+            if in_q == '"' and ch == "\\":
+                i += 2
+                continue
+            if ch == in_q:
+                in_q = ""
         elif ch in ("'", '"'):
-            in_q = True
-            q = ch
+            in_q = ch
         elif ch == "#":
             return rest[i:].strip()
+        i += 1
     return ""
 
 
@@ -97,11 +118,11 @@ def write_config(vals: dict) -> None:
         if k not in vals:
             continue
         comment = _trailing_comment(rest)
-        lines[i] = f'{k}="{_clean(vals[k])}"' + (f"  {comment}" if comment else "")
+        lines[i] = f"{k}={_quote(vals[k])}" + (f"  {comment}" if comment else "")
         seen.add(k)
     for k, v in vals.items():
         if k not in seen:
-            lines.append(f'{k}="{_clean(v)}"')
+            lines.append(f"{k}={_quote(v)}")
     with open(CONFIG, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -144,14 +165,6 @@ def read_creds() -> list:
     return rows
 
 
-def read_psk():
-    try:
-        with open(PSK_FILE, encoding="utf-8") as f:
-            return f.read().strip() or None
-    except OSError:
-        return None
-
-
 def pump(stream, target, lock) -> None:
     try:
         for line in iter(stream.readline, ""):
@@ -177,6 +190,34 @@ def is_running(proc, lock) -> bool:
         return proc is not None and proc.poll() is None
 
 
+BSSID_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def validate_target(cfg: dict) -> str | None:
+    """Başlatma/kırma öncesi doğrulama. Hata metni veya None döner."""
+    ssid = (cfg.get("TARGET_SSID") or "").strip()
+    if not ssid:
+        return "SSID boş — hedef ağ seç"
+    if len(ssid.encode("utf-8")) > 32:
+        return "SSID 32 bayttan uzun"
+    bssid = (cfg.get("TARGET_BSSID") or "").strip()
+    if not BSSID_RE.match(bssid):
+        return "BSSID geçersiz (AA:BB:CC:DD:EE:FF)"
+    ch = (cfg.get("CHANNEL") or "").strip()
+    if not ch.isdigit() or not 1 <= int(ch) <= 196:
+        return "kanal 1-196 arası olmalı"
+    pw = cfg.get("WPA_PASS") or ""
+    if pw and not 8 <= len(pw) <= 63:
+        return "WPA2 parolası 8-63 karakter olmalı"
+    if not (cfg.get("MON_IF") or "").strip():
+        return "monitor arayüzü seçilmedi"
+    if not (cfg.get("AP_IF") or "").strip():
+        return "AP arayüzü seçilmedi"
+    if cfg.get("SINGLE_ADAPTER") != "1" and cfg.get("MON_IF") == cfg.get("AP_IF"):
+        return "MON_IF ve AP_IF aynı — tek adaptör modunu aç"
+    return None
+
+
 # ---------------------------------------------------------------- scan
 def scan_aps(iface: str, seconds: int = 15) -> dict:
     if not iface:
@@ -200,17 +241,49 @@ def scan_aps(iface: str, seconds: int = 15) -> dict:
                 return {"ok": False, "error": f"monitor mode: {exc}"}
 
         try:
-            subprocess.run(
+            info = subprocess.run(["iw", "dev", iface, "info"],
+                                  capture_output=True, text=True,
+                                  timeout=8).stdout
+        except Exception:
+            info = ""
+        if "type monitor" not in info:
+            return {"ok": False,
+                    "error": f"{iface} monitor mode'a alınamadı (kart desteklemiyor?)"}
+
+        err_path = os.path.join(work, "airodump.err")
+        errf = None
+        try:
+            errf = open(err_path, "wb")
+        except OSError:
+            pass
+        try:
+            proc = subprocess.Popen(
                 ["airodump-ng", "--band", "abg", "--output-format", "csv",
                  "-w", base, iface],
-                capture_output=True, timeout=seconds,
+                stdout=subprocess.DEVNULL,
+                stderr=errf if errf is not None else subprocess.DEVNULL,
             )
-        except subprocess.TimeoutExpired:
-            pass
         except FileNotFoundError:
             return {"ok": False, "error": "airodump-ng bulunamadı"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        finally:
+            if errf is not None:
+                errf.close()
+
+        try:
+            proc.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            # SIGTERM: airodump csv'yi diske yazıp kapanır (SIGKILL veri kaybettirir)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
 
         csv_path = None
         for cand in glob.glob(base + "-*.csv"):
@@ -248,8 +321,27 @@ def scan_aps(iface: str, seconds: int = 15) -> dict:
                         "essid": row[13].strip() or "(gizli)",
                     })
         aps.sort(key=lambda a: _int(a["power"]))
+        if not aps:
+            err_tail = ""
+            try:
+                with open(err_path, "r", errors="replace") as f:
+                    tail = [ln.strip() for ln in f if ln.strip()]
+                err_tail = tail[-1] if tail else ""
+            except OSError:
+                pass
+            if err_tail:
+                return {"ok": False, "error": f"airodump-ng: {err_tail}"}
         return {"ok": True, "aps": aps}
     finally:
+        # monitor modundan çık, uplink'i geri getir
+        for cmd in (["ip", "link", "set", iface, "down"],
+                    ["iw", "dev", iface, "set", "type", "managed"],
+                    ["ip", "link", "set", iface, "up"],
+                    ["systemctl", "restart", "NetworkManager"]):
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=20)
+            except Exception:
+                pass
         shutil.rmtree(work, ignore_errors=True)
         SCAN_LOCK.release()
 
@@ -264,7 +356,7 @@ CONFIG_KEYS = (
     "MON_IF", "AP_IF", "UPLINK_IF", "SINGLE_ADAPTER",
     "TARGET_SSID", "TARGET_BSSID", "CHANNEL", "WPA_PASS",
     "PORTAL_TEMPLATE", "BRAND", "SUCCESS_URL", "SHARE_INTERNET",
-    "WORDLIST", "CAPTURE_TIMEOUT",
+    "CAPTURE_TIMEOUT",
 )
 
 
@@ -285,6 +377,8 @@ def api_config_set():
 def api_scan():
     if is_running(PROC, PROC_LOCK):
         return jsonify(ok=False, error="oturum çalışırken taranamaz"), 400
+    if is_running(CPROC, CPROC_LOCK):
+        return jsonify(ok=False, error="yakalama çalışırken taranamaz"), 400
     body = request.get_json(silent=True) or {}
     iface = body.get("iface") or read_config().get("MON_IF", "")
     try:
@@ -294,24 +388,27 @@ def api_scan():
     return jsonify(scan_aps(iface, max(5, min(seconds, 60))))
 
 
-@app.post("/api/crack")
-def api_crack():
-    global CPROC
+@app.post("/api/capture")
+def api_capture():
+    global CPROC, CAPTURE_BSSID
+    if is_running(PROC, PROC_LOCK):
+        return jsonify(ok=False, error="oturum çalışırken yakalanamaz"), 400
     with CPROC_LOCK:
         if CPROC is not None and CPROC.poll() is None:
-            return jsonify(ok=False, error="kırma zaten çalışıyor"), 400
+            return jsonify(ok=False, error="yakalama zaten çalışıyor"), 400
         vals = request.get_json(silent=True) or {}
         if vals:
             write_config({k: vals[k] for k in (
                 "MON_IF", "TARGET_SSID", "TARGET_BSSID", "CHANNEL",
-                "WORDLIST", "CAPTURE_TIMEOUT",
+                "CAPTURE_TIMEOUT",
             ) if k in vals})
+        cfg = read_config()
+        problem = validate_target(cfg)
+        if problem:
+            return jsonify(ok=False, error=problem), 400
+        CAPTURE_BSSID = (cfg.get("TARGET_BSSID") or "").strip().upper()
         with CLOG_LOCK:
             CLOG.clear()
-        try:
-            os.remove(PSK_FILE)
-        except OSError:
-            pass
         CPROC = subprocess.Popen(
             ["bash", AUTOPWN],
             cwd=BASE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -322,8 +419,8 @@ def api_crack():
     return jsonify(ok=True)
 
 
-@app.post("/api/crack/stop")
-def api_crack_stop():
+@app.post("/api/capture/stop")
+def api_capture_stop():
     global CPROC
     with CPROC_LOCK:
         if CPROC is None or CPROC.poll() is not None:
@@ -339,23 +436,28 @@ def api_crack_stop():
     return jsonify(ok=True)
 
 
-@app.get("/api/crack/status")
-def api_crack_status():
+@app.get("/api/capture/status")
+def api_capture_status():
     with CLOG_LOCK:
         tail = CLOG[-140:]
     return jsonify(running=is_running(CPROC, CPROC_LOCK),
-                   log=tail, psk=read_psk())
+                   log=tail, bssid=CAPTURE_BSSID)
 
 
 @app.post("/api/start")
 def api_start():
     global PROC
+    if is_running(CPROC, CPROC_LOCK):
+        return jsonify(ok=False, error="yakalama sürüyor — önce durdur"), 400
     with PROC_LOCK:
         if PROC is not None and PROC.poll() is None:
             return jsonify(ok=False, error="zaten çalışıyor"), 400
         vals = request.get_json(silent=True) or {}
         if vals:
             write_config(vals)
+        problem = validate_target(read_config())
+        if problem:
+            return jsonify(ok=False, error=problem), 400
         with LOG_LOCK:
             LOG.clear()
         PROC = subprocess.Popen(
@@ -376,7 +478,7 @@ def api_stop():
             return jsonify(ok=True, message="çalışmıyor")
         try:
             os.killpg(os.getpgid(PROC.pid), signal.SIGINT)
-            PROC.wait(timeout=20)
+            PROC.wait(timeout=45)
         except Exception:
             try:
                 os.killpg(os.getpgid(PROC.pid), signal.SIGKILL)
@@ -512,11 +614,6 @@ HTML = r"""<!doctype html>
   .ap .bssid{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
   .ap .ch{color:var(--dim)}
   .ap .sec{font-size:11px;color:var(--warn)}
-  .pskbox{margin-top:12px;padding:11px 13px;border-radius:10px;font-size:13px;
-    background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.4);
-    color:#9ff0c0;display:none}
-  .pskbox.on{display:block}
-  .pskbox b{color:#fff;font-family:var(--mono)}
 </style>
 </head>
 <body>
@@ -599,21 +696,18 @@ HTML = r"""<!doctype html>
 
     <!-- 3 -->
     <section class="pane" data-s="3">
-      <h2>Handshake kırma</h2>
-      <p class="hint">Hedef WPA2-PSK ise bu adım parolayı bulur. Bulunan PSK sahte AP'ye
-        yazılır, böylece istemciler kayıtlı profilleriyle otomatik bağlanır. Açık ağlarda
-        bu adımı atla.</p>
+      <h2>Handshake yakalama</h2>
+      <p class="hint">Hedef WPA2-PSK ise bu adım 4-way handshake'i yakalayıp
+        capture/ klasörüne .cap olarak kaydeder. Parolayı kendin biliyorsan
+        doğrudan WPA parolası alanına yaz; açık ağlarda bu adımı atla.</p>
       <div class="grid">
-        <div class="field"><label>Wordlist</label>
-          <input id="WORDLIST" placeholder="/usr/share/wordlists/rockyou.txt"></div>
         <div class="field"><label>Handshake zaman aşımı (sn)</label>
           <input id="CAPTURE_TIMEOUT" type="number" min="10" max="600" placeholder="60"></div>
       </div>
       <div class="row">
-        <button class="primary" id="btnCrack" onclick="crack()">⚡ Yakala &amp; kır</button>
+        <button class="primary" id="btnCrack" onclick="crack()">📡 Handshake yakala</button>
         <button class="stop" id="btnCrackStop" onclick="crackStop()" disabled>■ Durdur</button>
       </div>
-      <div class="pskbox" id="pskBox"></div>
       <pre class="log" id="crackLog">hazır.</pre>
       <div class="nav">
         <button onclick="go(2)">← Geri</button>
@@ -656,11 +750,11 @@ HTML = r"""<!doctype html>
 
 <script>
 const $ = id => document.getElementById(id);
-let step = 1, running = false, crackStarted = false, aps = [];
+let step = 1, running = false, crackStarted = false, aps = [], lastBssid = "";
 
 const FIELDS = ["MON_IF","AP_IF","UPLINK_IF","TARGET_SSID","TARGET_BSSID",
                 "CHANNEL","WPA_PASS","PORTAL_TEMPLATE","SUCCESS_URL",
-                "WORDLIST","CAPTURE_TIMEOUT"];
+                "CAPTURE_TIMEOUT"];
 
 function go(n){
   step = n;
@@ -755,6 +849,11 @@ function renderAps(list){
 function selectAp(i, row){
   const a = aps[i];
   if (!a) return;
+  if (lastBssid && lastBssid !== a.bssid){
+    $("WPA_PASS").value = "";
+    crackStarted = false;
+  }
+  lastBssid = a.bssid;
   $("TARGET_SSID").value = a.essid === "(gizli)" ? "" : a.essid;
   $("TARGET_BSSID").value = a.bssid;
   $("CHANNEL").value = a.channel;
@@ -777,27 +876,32 @@ async function scan(){
   $("scanInfo").textContent = (r.aps || []).length + " ağ";
 }
 
-/* ---------- kırma ---------- */
+/* ---------- handshake yakalama ---------- */
 async function crack(){
   crackStarted = true;
   $("btnCrack").disabled = true;
-  $("pskBox").classList.remove("on");
   $("crackLog").textContent = "başlatılıyor…\n";
-  await fetch("/api/crack", {
+  const r = await fetch("/api/capture", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(collect())
-  }).catch(() => {});
+  }).then(r => r.json()).catch(e => ({ok:false, error:String(e)}));
+  if (!r.ok){
+    crackStarted = false;
+    $("btnCrack").disabled = false;
+    $("crackLog").textContent = "HATA: " + (r.error || "bilinmiyor");
+    return;
+  }
   pollCrack();
 }
 
 async function crackStop(){
   $("btnCrackStop").disabled = true;
-  await fetch("/api/crack/stop", {method:"POST"});
+  await fetch("/api/capture/stop", {method:"POST"});
   pollCrack();
 }
 
 async function pollCrack(){
-  const s = await fetch("/api/crack/status").then(r => r.json()).catch(() => null);
+  const s = await fetch("/api/capture/status").then(r => r.json()).catch(() => null);
   if (!s) return;
   $("btnCrack").disabled = !!s.running;
   $("btnCrackStop").disabled = !s.running;
@@ -805,11 +909,6 @@ async function pollCrack(){
   const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
   el.innerHTML = (s.log || []).map(colorize).join("\n") || "hazır.";
   if (atBottom) el.scrollTop = el.scrollHeight;
-  if (crackStarted && s.psk){
-    $("WPA_PASS").value = s.psk;
-    $("pskBox").classList.add("on");
-    $("pskBox").innerHTML = "PSK bulundu: <b>" + esc(s.psk) + "</b> — hedef alanına yazıldı.";
-  }
 }
 
 /* ---------- başlat / durdur ---------- */

