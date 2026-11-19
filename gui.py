@@ -588,6 +588,10 @@ HTML = r"""<!doctype html>
     color:#9fb2cd;white-space:pre-wrap;margin:12px 0 0}
   pre.log .ok{color:#6ee7a0}
   pre.log .err{color:#ff8a8a}
+  .errbox{margin:10px 0 0;padding:10px 13px;border-radius:10px;font-size:13px;
+    background:rgba(255,92,92,.1);border:1px solid rgba(255,92,92,.4);
+    color:#ffb3b3;display:none}
+  .errbox.on{display:block}
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:6px}
   th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
     color:var(--dim);padding:8px 10px;border-bottom:1px solid var(--line)}
@@ -708,6 +712,7 @@ HTML = r"""<!doctype html>
         <button class="primary" id="btnCrack" onclick="crack()">📡 Handshake yakala</button>
         <button class="stop" id="btnCrackStop" onclick="crackStop()" disabled>■ Durdur</button>
       </div>
+      <div class="errbox" id="captureErrBox"></div>
       <pre class="log" id="crackLog">hazır.</pre>
       <div class="nav">
         <button onclick="go(2)">← Geri</button>
@@ -725,6 +730,7 @@ HTML = r"""<!doctype html>
         <button class="go" id="btnStart" onclick="start()">▶ Başlat</button>
         <button class="stop" id="btnStop" onclick="stop()" disabled>■ Durdur</button>
       </div>
+      <div class="errbox" id="startErrBox"></div>
       <pre class="log" id="log">hazır.</pre>
       <div class="nav">
         <button onclick="go(3)">← Geri</button>
@@ -880,6 +886,7 @@ async function scan(){
 async function crack(){
   crackStarted = true;
   $("btnCrack").disabled = true;
+  clearErr("captureErrBox");
   $("crackLog").textContent = "başlatılıyor…\n";
   const r = await fetch("/api/capture", {
     method:"POST", headers:{"Content-Type":"application/json"},
@@ -888,7 +895,7 @@ async function crack(){
   if (!r.ok){
     crackStarted = false;
     $("btnCrack").disabled = false;
-    $("crackLog").textContent = "HATA: " + (r.error || "bilinmiyor");
+    showErr("captureErrBox", r.error || "bilinmiyor");
     return;
   }
   pollCrack();
@@ -911,20 +918,38 @@ async function pollCrack(){
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 
+/* ---------- hata kutusu ---------- */
+function showErr(id, msg){
+  const el = $(id);
+  el.textContent = msg;
+  el.classList.add("on");
+}
+function clearErr(id){
+  const el = $(id);
+  el.classList.remove("on");
+  el.textContent = "";
+}
+
 /* ---------- başlat / durdur ---------- */
 async function start(){
   $("btnStart").disabled = true;
+  clearErr("startErrBox");
   $("log").textContent = "başlatılıyor…\n";
   const r = await fetch("/api/start", {
     method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify(collect())
   }).then(r => r.json()).catch(e => ({ok:false, error:String(e)}));
-  if (!r.ok) $("log").textContent += "HATA: " + (r.error || "bilinmiyor");
+  if (!r.ok){
+    $("btnStart").disabled = false;
+    showErr("startErrBox", r.error || "bilinmiyor");
+    return;
+  }
   poll();
 }
 
 async function stop(){
   $("btnStop").disabled = true;
+  clearErr("startErrBox");
   await fetch("/api/stop", {method:"POST"});
   poll();
 }
