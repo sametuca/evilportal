@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="2;url={{ target }}">
+<title>Doğrulanıyor…</title>
+<style>
+  body{
+    margin:0;min-height:100vh;place-items:center;background:#0b0f19;
+    color:#e8eefc;display:grid;
+    font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;
+  }
+  .box{text-align:center;padding:30px}
+  .spin{
+    width:46px;height:46px;margin:0 auto 20px;border-radius:50%;
+    border:3px solid #243044;border-top-color:#e1306c;
+    animation:s .9s linear infinite;
+  }
+  @keyframes s{to{transform:rotate(360deg)}}
+  p{color:#93a3bd;font-size:14px;margin:6px 0}
+  b{color:#fff}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="spin"></div>
+    <p><b>Doğrulama başarılı.</b></p>
+    <p>İnternet erişiminiz açılıyor…</p>
+  </div>
+</body>
+</html>

