@@ -10,6 +10,10 @@ AP_IF="wlan1"             # sahte AP arayüzü (ikinci adaptör)
 UPLINK_IF=""              # internet veren arayüz; boşsa otomatik bulunur
 SINGLE_ADAPTER=0          # 1 = tek adaptör (AP + sanal monitor vif)
 MON_VIF="evilmon"         # tek adaptör modunda oluşturulan sanal vif
+SPOOF_BSSID=0             # 1 = sahte AP'nin MAC'i TARGET_BSSID ile aynı olsun.
+                          # Gerçek AP hâlâ güçlü/yakınsa aynı BSSID çakışması
+                          # istemcilerde bağlantı hatasına yol açabilir — sadece
+                          # gerçek AP'yi güvenilir şekilde susturabiliyorsan aç.
 
 # ---------- Hedef ---------------------------------------------
 TARGET_SSID="KafeWiFi"                    # gerçek ağın SSID'si

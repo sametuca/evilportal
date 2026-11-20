@@ -263,11 +263,13 @@ iw dev "$MON_IF" set power_save off 2>/dev/null || true
 log "AP arayüzü: $AP_IF → $GATEWAY_IP/$SUBNET_MASK"
 ip link set "$AP_IF" down 2>/dev/null
 ip addr flush dev "$AP_IF" 2>/dev/null
-if ip link set "$AP_IF" address "$TARGET_BSSID" 2>/dev/null; then
-  log "AP MAC'i hedef BSSID ile eşleştirildi: $TARGET_BSSID"
-else
-  warn "AP MAC'i değiştirilemedi (kart desteklemiyor olabilir) — istemciler" \
-       "gerçek AP'yi farklı BSSID'den ayırt edip ona bağlı kalabilir"
+if [[ "$SPOOF_BSSID" == "1" ]]; then
+  if ip link set "$AP_IF" address "$TARGET_BSSID" 2>/dev/null; then
+    log "AP MAC'i hedef BSSID ile eşleştirildi: $TARGET_BSSID"
+  else
+    warn "AP MAC'i değiştirilemedi (kart desteklemiyor olabilir) — istemciler" \
+         "gerçek AP'yi farklı BSSID'den ayırt edip ona bağlı kalabilir"
+  fi
 fi
 ip addr add "$GATEWAY_IP/$SUBNET_MASK" dev "$AP_IF" \
   || die "IP atanamadı: $GATEWAY_IP/$SUBNET_MASK → $AP_IF"
