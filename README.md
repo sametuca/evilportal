@@ -204,7 +204,7 @@ Sınırlar:
 ```
 1. airmon-ng check kill          → NetworkManager susturulur
 2. wlan0 → monitor, kanal kilit  → deauth hazır
-3. wlan1 → 10.0.0.1, hostapd     → sahte AP yayında (aynı SSID)
+3. wlan1 → 10.0.0.1, hostapd     → sahte AP yayında (aynı SSID + BSSID)
 4. dnsmasq :53                   → DHCP + tüm alan adları 10.0.0.1
 5. dnsmasq :AUTH_DNS_PORT        → yetkili istemciler için gerçek çözümleme
 6. iptables DNAT :80 → portal    → HTTP portalda biter
@@ -299,6 +299,7 @@ python3 show.py -f       # canlı takip
 | Handshake yakalanmıyor | Hedefe bağlı istemci yok, kanal yanlış, ya da PMF aktif |
 | Deauth işe yaramıyor | 802.11w (PMF) aktif, ya da yanlış kanal/BSSID |
 | Tek adaptörde AP düşüyor | Yongaset uyumsuz — ikinci adaptör kullan |
+| Bağlandım ama portal hiç açılmadı, internet zaten çalışıyor | Muhtemelen sahte AP'ye değil **gerçek** hedefe bağlandın (aynı SSID iki yerden yayınlanıyor). İstemci cihazda bağlı ağın BSSID'sini kontrol et (iOS: ağın yanındaki ⓘ, Android: Wi-Fi detayları) ve `TARGET_BSSID` ile karşılaştır — farklıysa gerçek AP'ye bağlısın, deauth onu düşürmemiş demektir |
 | İnternet gelmiyor | `UPLINK_IF` yanlış veya `ip_forward` kapalı |
 | `wifi rfkill ile kapatılmış` | `sudo rfkill unblock wifi` |
 | `ipset` bulunamadı | `apt install ipset` |

