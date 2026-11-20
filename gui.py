@@ -349,7 +349,9 @@ def scan_aps(iface: str, seconds: int = 15) -> dict:
 # ---------------------------------------------------------------- api
 @app.get("/api/interfaces")
 def api_interfaces():
-    return jsonify(ifaces=list_ifaces())
+    mon_vif = (read_config().get("MON_VIF") or "evilmon").strip()
+    ifaces = [n for n in list_ifaces() if n != mon_vif]
+    return jsonify(ifaces=ifaces)
 
 
 CONFIG_KEYS = (

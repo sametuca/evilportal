@@ -72,6 +72,10 @@ if [[ -n "$WPA_PASS" ]]; then
 fi
 
 for iface in "$AP_IF" "$MON_IF"; do
+  [[ "$iface" != "$MON_VIF" ]] || \
+    die "MON_IF/AP_IF olarak '$MON_VIF' seçilmiş — bu, tek adaptör modunda" \
+        " script'in kendi oluşturduğu sanal arayüz, elle seçilmez." \
+        " Gerçek fiziksel kartı seç (ör. wlan0) ve SINGLE_ADAPTER=1 yap."
   ip link show "$iface" >/dev/null 2>&1 || \
     die "arayüz yok: '$iface' — ip link ile kontrol et"
 done
@@ -230,6 +234,9 @@ log "Eski süreçler durduruluyor"
 airmon-ng check kill >/dev/null 2>&1 || true
 pkill -x hostapd 2>/dev/null || true
 pkill -x dnsmasq 2>/dev/null || true
+# önceki yarım kalmış oturumdan kalma sanal vif'i temizle (ör. evilmon) —
+# yoksa arayüz listesinde görünüp yanlışlıkla MON_IF/AP_IF olarak seçilebilir
+iw dev "$MON_VIF" del 2>/dev/null || true
 sleep 1
 
 # ==============================================================
