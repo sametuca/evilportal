@@ -129,21 +129,31 @@ def write_config(vals: dict) -> None:
 
 # ---------------------------------------------------------------- helpers
 def list_ifaces() -> list:
-    names = []
+    """Kablosuz + kablolu tüm arayüzler (UPLINK_IF genelde eth0 gibi
+    kablolu bir arayüz olduğu için sadece 'iw dev' yetmez)."""
+    wireless = []
     try:
         out = subprocess.run(["iw", "dev"], capture_output=True, text=True,
                              timeout=5).stdout
-        names = re.findall(r"Interface (\S+)", out)
+        wireless = re.findall(r"Interface (\S+)", out)
     except Exception:
         pass
-    if not names:
-        try:
-            out = subprocess.run(["ip", "-br", "link"], capture_output=True,
-                                 text=True, timeout=5).stdout
-            names = [ln.split(":")[0].strip() for ln in out.splitlines() if ln.strip()]
-        except Exception:
-            pass
-    return [n for n in names if n]
+
+    all_ifaces = []
+    try:
+        out = subprocess.run(["ip", "-br", "link"], capture_output=True,
+                             text=True, timeout=5).stdout
+        all_ifaces = [ln.split(":")[0].strip() for ln in out.splitlines() if ln.strip()]
+    except Exception:
+        pass
+
+    seen = set()
+    names = []
+    for n in wireless + all_ifaces:
+        if n and n != "lo" and n not in seen:
+            seen.add(n)
+            names.append(n)
+    return names
 
 
 def read_creds() -> list:
