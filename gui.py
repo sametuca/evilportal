@@ -143,7 +143,15 @@ def list_ifaces() -> list:
     try:
         out = subprocess.run(["ip", "-br", "link"], capture_output=True,
                              text=True, timeout=5).stdout
-        all_ifaces = [ln.split(":")[0].strip() for ln in out.splitlines() if ln.strip()]
+        # 'ip -br link' sütunları boşlukla ayrılır: "eth0 UP 08:00:...  <FLAGS>"
+        # ilk sütun arayüz adı; vif'lerde "eth0@if5" gibi gelebilir, @ sonrasını at.
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            name = ln.split()[0].split("@")[0].strip()
+            if name:
+                all_ifaces.append(name)
     except Exception:
         pass
 
